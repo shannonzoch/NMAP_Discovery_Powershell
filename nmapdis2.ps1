@@ -11,6 +11,7 @@
 
     By default, the script automatically detects and excludes the machine running the scan from the targets.
     All scan outputs are saved to a uniquely named folder for easy review using a user-provided base filename.
+    The script will output the total run time upon completion.
 
 .PARAMETER Subnet
     The target subnet to scan, in CIDR notation (e.g., 192.168.1.0/24). This is a mandatory parameter.
@@ -44,7 +45,7 @@
 .EXAMPLE
     .\run-phased-nmap-scan.ps1 -Subnet 192.168.1.0/24 -BaseFileName corp-vlan10-scan -IncludeScanner
 
-    This command runs the same scan as above, but explicitly INCLUDES the scanning machine in the targets.
+    This command runs the same scan, but explicitly INCLUDES the scanning machine in the targets.
 
 .NOTES
     Requires Nmap to be installed on the system. Download from https://nmap.org/download.html
@@ -73,6 +74,9 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$OutputDirectory = "."
 )
+
+# Start timer for total run time calculation
+$startTime = Get-Date
 
 # --- PRE-FLIGHT CHECKS ---
 Write-Verbose "Starting pre-flight checks."
@@ -200,29 +204,35 @@ else {
 if ($openTcpPorts.Count -eq 0 -and $openUdpPorts.Count -eq 0) {
     Write-Host "`n[INFO] No open ports were discovered in Phase 1 or 2. Skipping detailed scan." -ForegroundColor Yellow
     Write-Host "Scan session complete. All logs are in: $sessionPath"
-    return
+    # Even if we skip phase 3, we still need to calculate and show the total run time.
 }
+else {
+    Write-Host "`n[PHASE 3] Starting detailed service scan on discovered open ports across $Subnet..." -ForegroundColor Cyan
+    $finalOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-combined"
 
-Write-Host "`n[PHASE 3] Starting detailed service scan on discovered open ports across $Subnet..." -ForegroundColor Cyan
-$finalOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-combined"
-
-# Dynamically build the port string for the final scan
-$portStringParts = [System.Collections.Generic.List[string]]::new()
-if ($openTcpPorts.Count -gt 0) {
-    $portStringParts.Add("T:$($openTcpPorts -join ',')")
+    # Dynamically build the port string for the final scan
+    $portStringParts = [System.Collections.Generic.List[string]]::new()
+    if ($openTcpPorts.Count -gt 0) {
+        $portStringParts.Add("T:$($openTcpPorts -join ',')")
+    }
+    if ($openUdpPorts.Count -gt 0) {
+        $portStringParts.Add("U:$($openUdpPorts -join ',')")
+    }
+    $finalPortString = $portStringParts -join ','
+    
+    $nmapArgsFinal = "-sV -sC -p $finalPortString $excludeArgument -oA `"$finalOutputFileBase`" $Subnet"
+    Write-Verbose "Executing: $NmapPath $nmapArgsFinal"
+    Invoke-Expression "$NmapPath $nmapArgsFinal"
 }
-if ($openUdpPorts.Count -gt 0) {
-    $portStringParts.Add("U:$($openUdpPorts -join ',')")
-}
-$finalPortString = $portStringParts -join ','
-
-$nmapArgsFinal = "-sV -sC -p $finalPortString $excludeArgument -oA `"$finalOutputFileBase`" $Subnet"
-Write-Verbose "Executing: $NmapPath $nmapArgsFinal"
-Invoke-Expression "$NmapPath $nmapArgsFinal"
 
 
 # --- COMPLETION ---
 Write-Host "`n[COMPLETE] Scan session finished." -ForegroundColor Green
-Write-Host "Final, detailed scan reports have been saved to the '$sessionPath' directory."
-Write-Host "Files created: $($finalOutputFileBase).nmap, .xml, .gnmap"
+Write-Host "All scan reports have been saved to the '$sessionPath' directory."
+
+# Calculate and display total run time
+$endTime = Get-Date
+$runTime = $endTime - $startTime
+$runTimeString = "{0:D2}h:{1:D2}m:{2:D2}s" -f $runTime.Hours, $runTime.Minutes, $runTime.Seconds
+Write-Host "Total script run time: $runTimeString" -ForegroundColor Green
 
