@@ -9,7 +9,7 @@
     3. A detailed service version detection (-sV) and default script enumeration (-sC) scan targeted
        only at the open ports discovered across the subnet in the first two phases.
 
-    This method is significantly faster and more efficient than a single, all-encompassing Nmap command.
+    By default, the script automatically detects and excludes the machine running the scan from the targets.
     All scan outputs are saved to a uniquely named folder for easy review using a user-provided base filename.
 
 .PARAMETER Subnet
@@ -17,6 +17,10 @@
 
 .PARAMETER BaseFileName
     A descriptive base name for all output files (e.g., my-favorite-switch-vlan2). This is a mandatory parameter.
+
+.PARAMETER IncludeScanner
+    If specified, the script will NOT exclude the local scanning machine from the Nmap scans. The default
+    behavior is to always exclude the scanner.
 
 .PARAMETER TopUdpPorts
     The number of top UDP ports to scan in Phase 2. The default is 200, which covers most common services.
@@ -34,8 +38,13 @@
 .EXAMPLE
     .\run-phased-nmap-scan.ps1 -Subnet 192.168.1.0/24 -BaseFileName corp-vlan10-scan
 
-    This command scans the 192.168.1.0/24 subnet. A new directory like 'scan_192.168.1.0_24_20251017T091000'
-    will be created, containing files like 'corp-vlan10-scan-tcpfast.nmap', 'corp-vlan10-scan-udpinitial.nmap', etc.
+    This command scans the 192.168.1.0/24 subnet and automatically excludes the scanning machine.
+    A new directory will be created, containing files like 'corp-vlan10-scan-tcpfast.nmap', etc.
+
+.EXAMPLE
+    .\run-phased-nmap-scan.ps1 -Subnet 192.168.1.0/24 -BaseFileName corp-vlan10-scan -IncludeScanner
+
+    This command runs the same scan as above, but explicitly INCLUDES the scanning machine in the targets.
 
 .NOTES
     Requires Nmap to be installed on the system. Download from https://nmap.org/download.html
@@ -48,6 +57,9 @@ param(
 
     [Parameter(Mandatory = $true)]
     [string]$BaseFileName,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$IncludeScanner,
 
     [Parameter(Mandatory = $false)]
     [int]$TopUdpPorts = 200,
@@ -94,6 +106,28 @@ catch {
     return
 }
 
+# Determine if the scanner's own IP should be excluded (default behavior)
+$excludeArgument = ""
+if (-not $IncludeScanner.IsPresent) {
+    Write-Verbose "Attempting to find local IP addresses to exclude from the scan (default behavior)."
+    try {
+        # Get all non-loopback, preferred IPv4 addresses for the local machine
+        $localIpAddresses = Get-NetIPAddress -AddressFamily IPv4 -AddressState Preferred | Where-Object { $_.InterfaceAlias -notlike "Loopback*" } | Select-Object -ExpandProperty IPAddress
+        
+        if ($localIpAddresses) {
+            $excludeList = $localIpAddresses -join ','
+            $excludeArgument = "--exclude $excludeList"
+            Write-Host "[+] Excluding scanner's IP(s) from scan: $excludeList (Use -IncludeScanner to override)" -ForegroundColor Green
+        } else {
+            Write-Warning "Could not determine a local IP address to exclude."
+        }
+    } catch {
+        Write-Warning "An error occurred while trying to determine the local IP address: $_"
+    }
+} else {
+    Write-Host "[+] The -IncludeScanner flag was specified. The local machine will be included in the scan." -ForegroundColor Yellow
+}
+
 
 # --- FUNCTION TO PARSE NMAP GREPABLE OUTPUT ---
 function Parse-NmapGrepableOutput {
@@ -133,7 +167,7 @@ function Parse-NmapGrepableOutput {
 # --- PHASE 1: Fast TCP Port Scan ---
 Write-Host "`n[PHASE 1] Starting fast TCP scan for all ports on subnet $Subnet..." -ForegroundColor Cyan
 $tcpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-tcpfast"
-$nmapArgsTcp = "-sS -p- --min-rate $MinRate -T4 -oA `"$tcpOutputFileBase`" $Subnet"
+$nmapArgsTcp = "-sS -p- --min-rate $MinRate -T4 $excludeArgument -oA `"$tcpOutputFileBase`" $Subnet"
 Write-Verbose "Executing: $NmapPath $nmapArgsTcp"
 Invoke-Expression "$NmapPath $nmapArgsTcp"
 
@@ -149,7 +183,7 @@ else {
 # --- PHASE 2: Common UDP Port Scan ---
 Write-Host "`n[PHASE 2] Starting scan for top $TopUdpPorts UDP ports on subnet $Subnet..." -ForegroundColor Cyan
 $udpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-udpinitial"
-$nmapArgsUdp = "-sU --top-ports $TopUdpPorts -T4 -oA `"$udpOutputFileBase`" $Subnet"
+$nmapArgsUdp = "-sU --top-ports $TopUdpPorts -T4 $excludeArgument -oA `"$udpOutputFileBase`" $Subnet"
 Write-Verbose "Executing: $NmapPath $nmapArgsUdp"
 Invoke-Expression "$NmapPath $nmapArgsUdp"
 
@@ -182,7 +216,7 @@ if ($openUdpPorts.Count -gt 0) {
 }
 $finalPortString = $portStringParts -join ','
 
-$nmapArgsFinal = "-sV -sC -p $finalPortString -oA `"$finalOutputFileBase`" $Subnet"
+$nmapArgsFinal = "-sV -sC -p $finalPortString $excludeArgument -oA `"$finalOutputFileBase`" $Subnet"
 Write-Verbose "Executing: $NmapPath $nmapArgsFinal"
 Invoke-Expression "$NmapPath $nmapArgsFinal"
 
