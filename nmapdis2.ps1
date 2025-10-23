@@ -1,20 +1,27 @@
 <#
 .SYNOPSIS
-    Automates a three-phased Nmap scan against a target subnet for efficient and thorough artifact collection.
+    Automates a three-phased Nmap scan against a target subnet or a list of hosts from a file.
 
 .DESCRIPTION
     This script streamlines network scanning by breaking the process into three phases:
-    1. A fast TCP SYN scan across all 65,535 ports on all hosts in the subnet to identify open TCP ports.
-    2. A scan for the most common UDP ports on all hosts to identify open UDP services.
+    1. A fast TCP SYN scan across all 65,535 ports on all targets to identify open TCP ports.
+    2. A scan for the most common UDP ports on all targets to identify open or open|filtered UDP services.
     3. A detailed service version detection (-sV) and default script enumeration (-sC) scan targeted
-       only at the open ports discovered across the subnet in the first two phases.
+       only at the open ports discovered across the targets in the first two phases.
+
+    The script requires either a -Subnet (e.g., 192.168.1.0/24) or an -InputList (e.g., ./my-hosts.txt).
 
     By default, the script automatically detects and excludes the machine running the scan from the targets.
     All scan outputs are saved to a uniquely named folder for easy review using a user-provided base filename.
     The script will output the total run time upon completion.
 
 .PARAMETER Subnet
-    The target subnet to scan, in CIDR notation (e.g., 192.168.1.0/24). This is a mandatory parameter.
+    The target subnet to scan, in CIDR notation (e.g., 192.168.1.0/24). This is a mandatory parameter
+    in the 'SubnetScan' parameter set. Cannot be used with -InputList.
+
+.PARAMETER InputList
+    The path to a file containing a list of target hosts (one per line). This is a mandatory parameter
+    in the 'ListScan' parameter set. Cannot be used with -Subnet.
 
 .PARAMETER BaseFileName
     A descriptive base name for all output files (e.g., my-favorite-switch-vlan2). This is a mandatory parameter.
@@ -43,18 +50,32 @@
     A new directory will be created, containing files like 'corp-vlan10-scan-tcpfast.nmap', etc.
 
 .EXAMPLE
-    .\run-phased-nmap-scan.ps1 -Subnet 192.168.1.0/24 -BaseFileName corp-vlan10-scan -IncludeScanner
+    .\run-phased-nmap-scan.ps1 -InputList C:\scans\server-list.txt -BaseFileName critical-servers-scan
 
-    This command runs the same scan, but explicitly INCLUDES the scanning machine in the targets.
+    This command scans only the hosts specified in the 'server-list.txt' file and saves the results
+    with the base name 'critical-servers-scan'.
 
 .NOTES
     Requires Nmap to be installed on the system. Download from https://nmap.org/download.html
     The script must be run with sufficient privileges to perform raw socket SYN scans (e.g., as an Administrator).
+	
+.CHANGES
+	Added ability to select targets with input ip list
+	Fixed a bug where udp ports are not scanned in the final version scan
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = "SubnetScan")]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = "SubnetScan")]
     [string]$Subnet,
+
+    [Parameter(Mandatory = $true, ParameterSetName = "ListScan")]
+    [ValidateScript({
+        if (-not (Test-Path -Path $_ -PathType Leaf)) {
+            throw "Input file not found: $_"
+        }
+        return $true
+    })]
+    [string]$InputList,
 
     [Parameter(Mandatory = $true)]
     [string]$BaseFileName,
@@ -92,10 +113,24 @@ catch {
 }
 
 # --- SETUP ---
-# Sanitize subnet name for use in file paths
-$sanitizedSubnet = $Subnet -replace '[^a-zA-Z0-9.-]', '_'
+$targetArgument = ""
+$sessionNameIdentifier = ""
+
+if ($PSCmdlet.ParameterSetName -eq "SubnetScan") {
+    $targetArgument = $Subnet
+    # Sanitize subnet name for use in file paths
+    $sessionNameIdentifier = $Subnet -replace '[^a-zA-Z0-9.-]', '_'
+    Write-Verbose "Scan target type: Subnet ($Subnet)"
+}
+elseif ($PSCmdlet.ParameterSetName -eq "ListScan") {
+    $targetArgument = "-iL `"$InputList`""
+    # Use a sanitized version of the input file name for the directory
+    $sessionNameIdentifier = (Get-Item $InputList).BaseName -replace '[^a-zA-Z0-9.-]', '_'
+    Write-Verbose "Scan target type: Input List ($InputList)"
+}
+
 $timestamp = Get-Date -Format "yyyyMMddTHHmmss"
-$sessionName = "scan_${sanitizedSubnet}_${timestamp}"
+$sessionName = "scan_${sessionNameIdentifier}_${timestamp}"
 $sessionPath = Join-Path -Path $OutputDirectory -ChildPath $sessionName
 
 # Create a dedicated directory for this scan session's output
@@ -148,8 +183,9 @@ function Parse-NmapGrepableOutput {
     $openPorts = [System.Collections.Generic.List[string]]::new()
     $content = Get-Content -Path $FilePath
     
-    # Regex to find port number and status, e.g., "80/open/tcp" or "53/open|filtered/udp"
-    $regex = "(\d+)\/open.*?\/${Protocol}"
+    # Regex to find port number and status.
+    # This now correctly captures "open" (for TCP) and "open|filtered" (common for UDP)
+    $regex = "(\d+)\/(open\|filtered|open).*?\/${Protocol}"
 
     # In a multi-host scan, each host with open ports will have a "Ports:" section
     foreach ($line in $content) {
@@ -169,34 +205,34 @@ function Parse-NmapGrepableOutput {
 # --- EXECUTION ---
 
 # --- PHASE 1: Fast TCP Port Scan ---
-Write-Host "`n[PHASE 1] Starting fast TCP scan for all ports on subnet $Subnet..." -ForegroundColor Cyan
+Write-Host "`n[PHASE 1] Starting fast TCP scan for all ports on targets: $targetArgument" -ForegroundColor Cyan
 $tcpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-tcpfast"
-$nmapArgsTcp = "-sS -p- --min-rate $MinRate -T4 $excludeArgument -oA `"$tcpOutputFileBase`" $Subnet"
+$nmapArgsTcp = "-sS -p- --min-rate $MinRate -T4 $excludeArgument -oA `"$tcpOutputFileBase`" $targetArgument"
 Write-Verbose "Executing: $NmapPath $nmapArgsTcp"
 Invoke-Expression "$NmapPath $nmapArgsTcp"
 
 $openTcpPorts = Parse-NmapGrepableOutput -FilePath "$($tcpOutputFileBase).gnmap" -Protocol "tcp"
 if ($openTcpPorts.Count -gt 0) {
-    Write-Host "[+] Found $($openTcpPorts.Count) unique open TCP port(s) across the subnet: $($openTcpPorts -join ', ')" -ForegroundColor Green
+    Write-Host "[+] Found $($openTcpPorts.Count) unique open TCP port(s) across all targets: $($openTcpPorts -join ', ')" -ForegroundColor Green
 }
 else {
-    Write-Host "[-] No open TCP ports found on the subnet." -ForegroundColor Yellow
+    Write-Host "[-] No open TCP ports found on the targets." -ForegroundColor Yellow
 }
 
 
 # --- PHASE 2: Common UDP Port Scan ---
-Write-Host "`n[PHASE 2] Starting scan for top $TopUdpPorts UDP ports on subnet $Subnet..." -ForegroundColor Cyan
+Write-Host "`n[PHASE 2] Starting scan for top $TopUdpPorts UDP ports on targets: $targetArgument" -ForegroundColor Cyan
 $udpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-udpinitial"
-$nmapArgsUdp = "-sU --top-ports $TopUdpPorts -T4 $excludeArgument -oA `"$udpOutputFileBase`" $Subnet"
+$nmapArgsUdp = "-sU --top-ports $TopUdpPorts -T4 $excludeArgument -oA `"$udpOutputFileBase`" $targetArgument"
 Write-Verbose "Executing: $NmapPath $nmapArgsUdp"
-Invoke-Expression "$NmapPath $nmapArgsUdp"
+Invoke-Expression "$NmapPath $nmapArgsUdim"
 
 $openUdpPorts = Parse-NmapGrepableOutput -FilePath "$($udpOutputFileBase).gnmap" -Protocol "udp"
 if ($openUdpPorts.Count -gt 0) {
-    Write-Host "[+] Found $($openUdpPorts.Count) unique open UDP port(s) across the subnet: $($openUdpPorts -join ', ')" -ForegroundColor Green
+    Write-Host "[+] Found $($openUdpPorts.Count) unique open UDP port(s) across all targets: $($openUdpPorts -join ', ')" -ForegroundColor Green
 }
 else {
-    Write-Host "[-] No open UDP ports found on the subnet." -ForegroundColor Yellow
+    Write-Host "[-] No open UDP ports found on the targets." -ForegroundColor Yellow
 }
 
 
@@ -207,7 +243,7 @@ if ($openTcpPorts.Count -eq 0 -and $openUdpPorts.Count -eq 0) {
     # Even if we skip phase 3, we still need to calculate and show the total run time.
 }
 else {
-    Write-Host "`n[PHASE 3] Starting detailed service scan on discovered open ports across $Subnet..." -ForegroundColor Cyan
+    Write-Host "`n[PHASE 3] Starting detailed service scan on discovered open ports across targets: $targetArgument" -ForegroundColor Cyan
     $finalOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-combined"
 
     # Dynamically build the port string for the final scan
@@ -220,7 +256,7 @@ else {
     }
     $finalPortString = $portStringParts -join ','
     
-    $nmapArgsFinal = "-sV -sC -p $finalPortString $excludeArgument -oA `"$finalOutputFileBase`" $Subnet"
+    $nmapArgsFinal = "-sV -sC -p $finalPortString $excludeArgument -oA `"$finalOutputFileBase`" $targetArgument"
     Write-Verbose "Executing: $NmapPath $nmapArgsFinal"
     Invoke-Expression "$NmapPath $nmapArgsFinal"
 }
