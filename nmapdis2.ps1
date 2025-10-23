@@ -15,6 +15,20 @@
     All scan outputs are saved to a uniquely named folder for easy review using a user-provided base filename.
     The script will output the total run time upon completion.
 
+.VERSION
+    2.2.0
+
+.CHANGES
+    [2025-10-23] v2.2.0
+    - Updated version number to 2.2.0.
+
+    [2025-10-23] v1.1.0
+    - Reworked output directory naming to use [BaseFileName][Date]S[ScanNumber] format (e.g., vlan-scan20251023S001).
+    - Added .VERSION and .CHANGES log to the script header.
+
+    [2025-10-22] v1.0.1
+    - Fixed regex in Parse-NmapGrepableOutput to correctly find 'open|filtered' UDP ports.
+
 .PARAMETER Subnet
     The target subnet to scan, in CIDR notation (e.g., 192.168.1.0/24). This is a mandatory parameter
     in the 'SubnetScan' parameter set. Cannot be used with -InputList.
@@ -58,10 +72,6 @@
 .NOTES
     Requires Nmap to be installed on the system. Download from https://nmap.org/download.html
     The script must be run with sufficient privileges to perform raw socket SYN scans (e.g., as an Administrator).
-	
-.CHANGES
-	Added ability to select targets with input ip list
-	Fixed a bug where udp ports are not scanned in the final version scan
 #>
 [CmdletBinding(DefaultParameterSetName = "SubnetScan")]
 param(
@@ -129,8 +139,31 @@ elseif ($PSCmdlet.ParameterSetName -eq "ListScan") {
     Write-Verbose "Scan target type: Input List ($InputList)"
 }
 
-$timestamp = Get-Date -Format "yyyyMMddTHHmmss"
-$sessionName = "scan_${sessionNameIdentifier}_${timestamp}"
+# New folder naming logic: [BaseFileName][Date]S[ScanNumber]
+$dateStamp = Get-Date -Format "yyyyMMdd"
+$searchPattern = "$($BaseFileName)$($dateStamp)S*"
+
+# Find existing scan folders for today with the same base name
+$existingScans = Get-ChildItem -Path $OutputDirectory -Directory -Filter $searchPattern -ErrorAction SilentlyContinue
+
+$maxScanNum = 0
+if ($existingScans) {
+    foreach ($scanFolder in $existingScans) {
+        # Match the S001, S002, etc. part
+        $match = [regex]::Match($scanFolder.Name, "$($BaseFileName)$($dateStamp)S(\d{3})$")
+        if ($match.Success) {
+            $currentScanNum = [int]$match.Groups[1].Value
+            if ($currentScanNum -gt $maxScanNum) {
+                $maxScanNum = $currentScanNum
+            }
+        }
+    }
+}
+
+$newScanNum = $maxScanNum + 1
+$newScanNumString = "{0:D3}" -f $newScanNum # Format as 3 digits (001, 002, etc.)
+
+$sessionName = "$($BaseFileName)$($dateStamp)S$($newScanNumString)"
 $sessionPath = Join-Path -Path $OutputDirectory -ChildPath $sessionName
 
 # Create a dedicated directory for this scan session's output
@@ -271,4 +304,3 @@ $endTime = Get-Date
 $runTime = $endTime - $startTime
 $runTimeString = "{0:D2}h:{1:D2}m:{2:D2}s" -f $runTime.Hours, $runTime.Minutes, $runTime.Seconds
 Write-Host "Total script run time: $runTimeString" -ForegroundColor Green
-
