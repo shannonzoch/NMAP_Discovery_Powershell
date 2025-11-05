@@ -18,9 +18,12 @@
     The script will output the total run time upon completion.
 
 .VERSION
-    2.3.1
+    2.3.2
 
 .CHANGES
+    [2025-11-05] v2.3.2
+    - FEATURE: Added generation of a <BaseFileName>-hosts.txt file containing all detected IP addresses after discovery scans (Phase 1 & 2) are complete.
+
     [2025-11-05] v2.3.1
     - FEATURE/FIX: Implemented robust XML consolidation for Phase 3. The script now parses individual temporary XML files,
       extracts all <host> nodes, and injects them into a single, valid <nmaprun> document, fixing the multi-root XML error.
@@ -311,6 +314,17 @@ if ($udpPortCount -gt 0) {
 }
 else {
     Write-Host "[-] No open UDP ports found on the targets." -ForegroundColor Yellow
+}
+
+# --- CREATE HOSTS.TXT FILE ---
+$hostsFile = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-hosts.txt"
+$uniqueIPs = $masterTargetPorts.Keys | Sort-Object
+
+if ($uniqueIPs.Count -gt 0) {
+    $uniqueIPs | Out-File -FilePath $hostsFile -Force -Encoding ASCII
+    Write-Host "[+] Wrote list of $($uniqueIPs.Count) active hosts to: $hostsFile" -ForegroundColor Green
+} else {
+    Write-Host "[-] No active hosts detected to write to hosts.txt." -ForegroundColor Yellow
 }
 
 $totalTargets = $masterTargetPorts.Count
