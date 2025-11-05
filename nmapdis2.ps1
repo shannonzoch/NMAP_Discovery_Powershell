@@ -18,9 +18,23 @@
     The script will output the total run time upon completion.
 
 .VERSION
-    2.3.2
+    2.3.5
 
 .CHANGES
+    [2025-11-05] v2.3.5
+    - CRITICAL FIX: Fixed PowerShell string interpolation error: "Variable reference is not valid. ':' was not followed by valid variable character."
+      Corrected `$ip:` to `${ip}:` in the Write-Host and Write-Warning lines in Phase 3 to properly delimit the variable name.
+
+    [2025-11-05] v2.3.4
+    - CRITICAL FIX: Refactored target argument handling for -Subnet and -InputList. Replaced the unreliable
+      `-split ' '` logic with a dedicated array (`$targetArgumentArray`) built during SETUP. This fixes potential
+      failures when passing the -iL parameter.
+    - LOGIC FIX: Added a guardrail in Phase 3 to check for hosts with no open ports (e.g., if they went offline
+      between phases) and skip them to prevent empty Nmap commands.
+
+    [2025-11-05] v2.3.3
+    - CRITICAL FIX: Replaced all instances of Invoke-Expression with the array-based call operator (&) and explicit argument arrays. This eliminates complex string quoting issues (like the "not followed by a valid variable name character" error) and drastically improves script robustness against paths/variables containing spaces.
+
     [2025-11-05] v2.3.2
     - FEATURE: Added generation of a <BaseFileName>-hosts.txt file containing all detected IP addresses after discovery scans (Phase 1 & 2) are complete.
 
@@ -88,7 +102,7 @@
 .EXAMPLE
     .\run-phased-nmap-scan.ps1 -InputList C:\scans\server-list.txt -BaseFileName critical-servers-scan
 
-    This command scans only the hosts specified in the 'server-list.txt' file and saves the results
+    This command scans only the hosts specified in the 'server-list.txt' file and saves the.
     with the base name 'critical-servers-scan'.
 
 .NOTES
@@ -145,17 +159,17 @@ catch {
 }
 
 # --- SETUP ---
-$targetArgument = ""
+$targetArgumentArray = @() # Use an array for Nmap target arguments
 $sessionNameIdentifier = ""
 
 if ($PSCmdlet.ParameterSetName -eq "SubnetScan") {
-    $targetArgument = $Subnet
+    $targetArgumentArray = @($Subnet)
     # Sanitize subnet name for use in file paths
     $sessionNameIdentifier = $Subnet -replace '[^a-zA-Z0-9.-]', '_'
     Write-Verbose "Scan target type: Subnet ($Subnet)"
 }
 elseif ($PSCmdlet.ParameterSetName -eq "ListScan") {
-    $targetArgument = "-iL `"$InputList`""
+    $targetArgumentArray = @("-iL", $InputList)
     # Use a sanitized version of the input file name for the directory
     $sessionNameIdentifier = (Get-Item $InputList).BaseName -replace '[^a-zA-Z0-9.-]', '_'
     Write-Verbose "Scan target type: Input List ($InputList)"
@@ -180,7 +194,7 @@ catch {
 }
 
 # Determine if the scanner's own IP should be excluded (default behavior)
-$excludeArgument = ""
+$excludeArgumentArray = @() # Use an array for the exclude argument
 if (-not $IncludeScanner.IsPresent) {
     Write-Verbose "Attempting to find local IP addresses to exclude from the scan (default behavior)."
     try {
@@ -189,7 +203,7 @@ if (-not $IncludeScanner.IsPresent) {
         
         if ($localIpAddresses) {
             $excludeList = $localIpAddresses -join ','
-            $excludeArgument = "--exclude $excludeList"
+            $excludeArgumentArray = @("--exclude", $excludeList)
             Write-Host "[+] Excluding scanner's IP(s) from scan: $excludeList (Use -IncludeScanner to override)" -ForegroundColor Green
         } else {
             Write-Warning "Could not determine a local IP address to exclude."
@@ -264,11 +278,18 @@ $allHostNodes = [System.Collections.ArrayList]::new()
 
 
 # --- PHASE 1: Fast TCP Port Scan ---
-Write-Host "`n[PHASE 1] Starting fast TCP scan for all ports on targets: $targetArgument" -ForegroundColor Cyan
+Write-Host "`n[PHASE 1] Starting fast TCP scan for all ports on targets: $($targetArgumentArray -join ' ')" -ForegroundColor Cyan
 $tcpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-tcpfast"
-$nmapArgsTcp = "-sS -p- --min-rate $MinRate -T4 $excludeArgument -oA `"$tcpOutputFileBase`" $targetArgument"
-Write-Verbose "Executing: $NmapPath $nmapArgsTcp"
-Invoke-Expression "$NmapPath $nmapArgsTcp"
+
+# Build argument array for safe execution
+$nmapArgsTcpArray = @("-sS", "-p-", "--min-rate", "$MinRate", "-T4")
+if ($excludeArgumentArray.Count -gt 0) { $nmapArgsTcpArray += $excludeArgumentArray }
+$nmapArgsTcpArray += @("-oA", $tcpOutputFileBase)
+$nmapArgsTcpArray += $targetArgumentArray # Add target(s)
+
+Write-Verbose "Executing: $NmapPath $($nmapArgsTcpArray -join ' ')"
+# Execute Nmap using the call operator (&)
+& $NmapPath @nmapArgsTcpArray
 
 $tcpPortsPerIp = Parse-NmapGrepableOutput -FilePath "$($tcpOutputFileBase).gnmap" -Protocol "tcp"
 $tcpPortCount = 0
@@ -289,11 +310,18 @@ else {
 
 
 # --- PHASE 2: Common UDP Port Scan ---
-Write-Host "`n[PHASE 2] Starting scan for top $TopUdpPorts UDP ports on targets: $targetArgument" -ForegroundColor Cyan
+Write-Host "`n[PHASE 2] Starting scan for top $TopUdpPorts UDP ports on targets: $($targetArgumentArray -join ' ')" -ForegroundColor Cyan
 $udpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-udpinitial"
-$nmapArgsUdp = "-sU --top-ports $TopUdpPorts -T4 $excludeArgument -oA `"$udpOutputFileBase`" $targetArgument"
-Write-Verbose "Executing: $NmapPath $nmapArgsUdp"
-Invoke-Expression "$NmapPath $nmapArgsUdp"
+
+# Build argument array for safe execution
+$nmapArgsUdpArray = @("-sU", "--top-ports", "$TopUdpPorts", "-T4")
+if ($excludeArgumentArray.Count -gt 0) { $nmapArgsUdpArray += $excludeArgumentArray }
+$nmapArgsUdpArray += @("-oA", $udpOutputFileBase)
+$nmapArgsUdpArray += $targetArgumentArray # Add target(s)
+
+Write-Verbose "Executing: $NmapPath $($nmapArgsUdpArray -join ' ')"
+# Execute Nmap using the call operator (&)
+& $NmapPath @nmapArgsUdpArray
 
 $udpPortsPerIp = Parse-NmapGrepableOutput -FilePath "$($udpOutputFileBase).gnmap" -Protocol "udp"
 $udpPortCount = 0
@@ -353,18 +381,26 @@ else {
         $tcpPorts = $masterTargetPorts[$ip]["tcp"]
         $udpPorts = $masterTargetPorts[$ip]["udp"]
         
-        Write-Host "    [Target $scanCount/$totalTargets] Scanning $ip: T: $($tcpPorts.Count) port(s), U: $($udpPorts.Count) port(s)" -ForegroundColor Yellow
+        # LOGIC FIX: Check if there are actually any ports to scan for this IP
+        if ($tcpPorts.Count -eq 0 -and $udpPorts.Count -eq 0) {
+            # FIX: Use ${ip} to delimit variable name
+            Write-Warning "    [Target $scanCount/$totalTargets] Skipping ${ip}: No open ports were found in discovery."
+            continue
+        }
+        
+        # FIX: Use ${ip} to delimit variable name
+        Write-Host "    [Target $scanCount/$totalTargets] Scanning ${ip}: T: $($tcpPorts.Count) port(s), U: $($udpPorts.Count) port(s)" -ForegroundColor Yellow
 
         $portStringParts = [System.Collections.Generic.List[string]]::new()
-        $scanTypeArgument = ""
+        $nmapArgsFinalArray = @() # Use array for arguments
 
         if ($tcpPorts.Count -gt 0) {
             $portStringParts.Add("T:$($tcpPorts -join ',')")
-            $scanTypeArgument += " -sS"
+            $nmapArgsFinalArray += "-sS"
         }
         if ($udpPorts.Count -gt 0) {
             $portStringParts.Add("U:$($udpPorts -join ',')")
-            $scanTypeArgument += " -sU"
+            $nmapArgsFinalArray += "-sU"
         }
         
         $finalPortString = $portStringParts -join ','
@@ -372,12 +408,12 @@ else {
         # Build the Nmap command for this single IP
         $tempOutputFileBase = Join-Path -Path $sessionPath -ChildPath "temp_$($ip.Replace('.', '_'))"
         
-        # -sV, -sC, and -p are included; -oA is used for the temp file
-        $nmapArgsFinal = "$scanTypeArgument -sV -sC -p $finalPortString -oA `"$tempOutputFileBase`" $ip"
-        Write-Verbose "Executing: $NmapPath $nmapArgsFinal"
+        # Add core arguments: -sV, -sC, -p, -oA, temp_base, and IP
+        $nmapArgsFinalArray += @("-sV", "-sC", "-p", $finalPortString, "-oA", $tempOutputFileBase, $ip)
+        Write-Verbose "Executing: $NmapPath $($nmapArgsFinalArray -join ' ')"
         
-        # Run the Nmap command
-        Invoke-Expression "$NmapPath $nmapArgsFinal"
+        # Run the Nmap command using the call operator (&)
+        & $NmapPath @nmapArgsFinalArray
         
         # --- Consolidation: Nmap/Grepable (Simple Append) ---
         Get-Content "$($tempOutputFileBase).nmap" -ErrorAction SilentlyContinue | Add-Content -Path $finalNmapFile
@@ -453,5 +489,5 @@ Write-Host "All scan reports have been saved to the '$sessionPath' directory."
 # Calculate and display total run time
 $endTime = Get-Date
 $runTime = $endTime - $startTime
-$runTimeString = "{0:D2}h:{1:D2}m:{2:D2}s" -f $runTime.Hours, $runTime.Minutes, $runTime.Seconds
+$runTimeString = "{0:D2}h:{1:D2}m:{2:DD}s" -f $runTime.Hours, $runTime.Minutes, $runTime.Seconds
 Write-Host "Total script run time: $runTimeString" -ForegroundColor Green
