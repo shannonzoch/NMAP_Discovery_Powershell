@@ -1,1 +1,129 @@
+<#
+.SYNOPSIS
+Scans a specified subnet using Nmap with OS detection and separates the results
+into three files: one for Windows IPs, one for Linux IPs, and one for Unknown/Other OS IPs.
 
+.DESCRIPTION
+This script requires Nmap to be installed and available in the system's PATH.
+It executes Nmap in a grepable output format (-oG), which is then parsed
+to identify the OS (Windows or Linux) associated with each 'Up' host,
+writing the IP addresses to the respective output files.
+
+.PARAMETER Subnet
+The target subnet to scan (e.g., 192.168.1.0/24).
+
+.PARAMETER WindowsOutputFile
+The full path and filename for the output file containing Windows IP addresses. Defaults to 'wip.txt'.
+
+.PARAMETER LinuxOutputFile
+The full path and filename for the output file containing Linux IP addresses. Defaults to 'lip.txt'.
+
+.PARAMETER UnknownOutputFile
+The full path and filename for the output file containing IPs where the OS could not be classified. Defaults to 'uip.txt'.
+
+.EXAMPLE
+# Runs scan using the default output files (wip.txt, lip.txt, uip.txt)
+.\scan_subnet.ps1 -Subnet "192.168.1.0/24"
+
+.EXAMPLE
+# Runs scan using custom output files
+.\scan_subnet.ps1 -Subnet "192.168.1.0/24" -WindowsOutputFile "C:\ScanData\windows_ips.txt" -LinuxOutputFile "C:\ScanData\linux_ips.txt" -UnknownOutputFile "C:\ScanData\other_ips.txt"
+#>
+# --- Version and Change Tracker ---
+# Version 0.0.2 - 2025-11-05
+# - Changed default output filenames to 'wip.txt', 'lip.txt', and 'uip.txt'.
+# Version 0.0.1 - 2025-11-05
+# - Initial script version with Windows and Linux filtering.
+# - Added version tracking.
+# - Added support for saving "Unknown OS" IPs to a third file.
+# ----------------------------------
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$Subnet,
+
+    [Parameter(Mandatory=$false)]
+    [string]$WindowsOutputFile = "wip.txt",
+
+    [Parameter(Mandatory=$false)]
+    [string]$LinuxOutputFile = "lip.txt",
+
+    [Parameter(Mandatory=$false)]
+    [string]$UnknownOutputFile = "uip.txt"
+)
+
+# --- Configuration ---
+$NmapPath = "nmap"
+$TempGrepableFile = "temp_nmap_results.gnmap"
+
+# --- Prerequisites Check ---
+
+# Check if Nmap is callable
+if (-not (Get-Command $NmapPath -ErrorAction SilentlyContinue)) {
+    Write-Error "Nmap is not found in the system PATH. Please install Nmap and ensure it is accessible."
+    exit 1
+}
+
+Write-Host "Starting Nmap scan on subnet: $Subnet..."
+Write-Host "This scan uses OS detection (-O) and may take several minutes..."
+
+# --- 1. Execute Nmap Scan ---
+# -O: Enable OS detection
+# -T4: Aggressive timing template
+# -oG: Grepable output format for easy parsing
+$nmapArguments = "-O -T4 -oG $TempGrepableFile $Subnet"
+
+# Run Nmap and capture output/errors
+try {
+    & $NmapPath $nmapArguments | Out-Null
+} catch {
+    Write-Error "An error occurred during Nmap execution: $_"
+    Remove-Item $TempGrepableFile -ErrorAction SilentlyContinue
+    exit 1
+}
+
+# Check if the temporary file was created
+if (-not (Test-Path $TempGrepableFile)) {
+    Write-Error "Nmap scan completed, but the output file was not created. Check Nmap permissions or the target subnet."
+    exit 1
+}
+
+Write-Host "Nmap scan complete. Parsing results..."
+
+# --- 2. Clear Existing Output Files ---
+# We clear the files before processing to ensure clean results
+Clear-Content $WindowsOutputFile -ErrorAction SilentlyContinue
+Clear-Content $LinuxOutputFile -ErrorAction SilentlyContinue
+Clear-Content $UnknownOutputFile -ErrorAction SilentlyContinue
+
+# --- 3. Parse and Filter Results ---
+Get-Content $TempGrepableFile |
+    # Only process lines that represent a host entry and are 'Up'
+    Select-String '^Host: .*\sStatus: Up' |
+    ForEach-Object {
+        $line = $_.ToString()
+        # The IP address is the second token in the grepable format (e.g., Host: 192.168.1.1 ...)
+        $ip = $line.Split(' ')[1]
+
+        if ($line -match 'OS: Windows') {
+            # Found Windows OS
+            $ip | Out-File -FilePath $WindowsOutputFile -Append
+            Write-Host "-> Found Windows: $ip"
+        } elseif ($line -match 'OS: Linux') {
+            # Found Linux OS
+            $ip | Out-File -FilePath $LinuxOutputFile -Append
+            Write-Host "-> Found Linux: $ip"
+        } else {
+            # Not explicitly matched as Windows or Linux (Unknown/Other OS)
+            $ip | Out-File -FilePath $UnknownOutputFile -Append
+            Write-Host "-> Found Unknown/Other OS: $ip"
+        }
+    }
+
+# --- 4. Cleanup and Summary ---
+Remove-Item $TempGrepableFile -ErrorAction SilentlyContinue
+
+Write-Host "`n--- Summary ---"
+Write-Host "Windows IPs saved to: $WindowsOutputFile (Count: $( (Get-Content $WindowsOutputFile | Measure-Object -ErrorAction SilentlyContinue).Count ))"
+Write-Host "Linux IPs saved to: $LinuxOutputFile (Count: $( (Get-Content $LinuxOutputFile | Measure-Object -ErrorAction SilentlyContinue).Count ))"
+Write-Host "Unknown IPs saved to: $UnknownOutputFile (Count: $( (Get-Content $UnknownOutputFile | Measure-Object -ErrorAction SilentlyContinue).Count ))"
+Write-Host "Processing complete."
