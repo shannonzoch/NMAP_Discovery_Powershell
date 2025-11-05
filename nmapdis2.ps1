@@ -1,13 +1,14 @@
 <#
 .SYNOPSIS
-    Automates a three-phased Nmap scan against a target subnet or a list of hosts from a file.
+    Automates a three-phased, per-host Nmap scan against a target subnet or a list of hosts from a file.
 
 .DESCRIPTION
     This script streamlines network scanning by breaking the process into three phases:
     1. A fast TCP SYN scan across all 65,535 ports on all targets to identify open TCP ports.
     2. A scan for the most common UDP ports on all targets to identify open or open|filtered UDP services.
     3. A detailed service version detection (-sV) and default script enumeration (-sC) scan targeted
-       only at the open ports discovered across the targets in the first two phases.
+       ONLY at the specific open ports previously discovered on each individual IP address. This per-host
+       approach significantly improves efficiency and speed for the most time-intensive phase.
 
     The script requires either a -Subnet (e.g., 192.168.1.0/24) or an -InputList (e.g., ./my-hosts.txt).
 
@@ -17,9 +18,18 @@
     The script will output the total run time upon completion.
 
 .VERSION
-    2.2.2
+    2.3.1
 
 .CHANGES
+    [2025-11-05] v2.3.1
+    - FEATURE/FIX: Implemented robust XML consolidation for Phase 3. The script now parses individual temporary XML files,
+      extracts all <host> nodes, and injects them into a single, valid <nmaprun> document, fixing the multi-root XML error.
+
+    [2025-11-05] v2.3.0
+    - MAJOR FEATURE/FIX: Rewrote parsing logic to associate discovered open ports with specific IP addresses.
+    - PHASE 3 Rework: Replaced the single, subnet-wide final scan with a targeted 'per-host' loop, ensuring -sV and -sC
+      scripts only run against ports already found open on that specific IP. This greatly improves efficiency.
+
     [2025-11-05] v2.2.2
     - FIXED BUG: Ensured the -sU flag is correctly passed to the final combined scan (Phase 3) when UDP ports are present,
       preventing Nmap from ignoring the 'U:' port specifier.
@@ -198,32 +208,57 @@ function Parse-NmapGrepableOutput {
     
     if (-not (Test-Path $FilePath)) {
         Write-Warning "Grepable output file not found: $FilePath"
-        return @()
+        return @{}
     }
 
-    $openPorts = [System.Collections.Generic.List[string]]::new()
+    # Dictionary to store results: { 'IP_Address' = @{ 'tcp' = @('port1', ...); 'udp' = @('port1', ...) } }
+    $openPortsPerIp = @{}
     $content = Get-Content -Path $FilePath
     
-    # Regex to find port number and status.
-    # This now correctly captures "open" (for TCP) and "open|filtered" (common for UDP)
-    $regex = "(\d+)\/(open\|filtered|open).*?\/${Protocol}"
+    # Regex to find the Host IP address and all relevant ports in the Ports line
+    # Matches: IP: (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) and Port: (\d+)\/(open\|filtered|open).*?\/${Protocol}
+    $hostRegex = "^Host: (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
+    $portRegex = "(\d+)\/(open\|filtered|open).*?\/${Protocol}"
+    
+    $currentIP = $null
 
-    # In a multi-host scan, each host with open ports will have a "Ports:" section
     foreach ($line in $content) {
-        if ($line -match "Ports:") {
-            $matches = [regex]::Matches($line, $regex)
+        # 1. Capture the Host IP
+        if ($line -match $hostRegex) {
+            $currentIP = $Matches[1]
+            # Initialize the IP entry if it doesn't exist
+            if (-not $openPortsPerIp.ContainsKey($currentIP)) {
+                $openPortsPerIp[$currentIP] = @{}
+                $openPortsPerIp[$currentIP]["tcp"] = [System.Collections.Generic.List[string]]::new()
+                $openPortsPerIp[$currentIP]["udp"] = [System.Collections.Generic.List[string]]::new()
+            }
+        }
+        
+        # 2. Capture the Ports line
+        if ($line -match "Ports:" -and $currentIP -ne $null) {
+            $matches = [regex]::Matches($line, $portRegex)
             foreach ($match in $matches) {
-                if (-not $openPorts.Contains($match.Groups[1].Value)) {
-                    $openPorts.Add($match.Groups[1].Value)
+                $port = $match.Groups[1].Value
+                
+                # We need to explicitly check if the port list is for the correct protocol
+                if ($line -match "${port}\/(open\|filtered|open).*?\/${Protocol}" -and -not $openPortsPerIp[$currentIP][$Protocol].Contains($port)) {
+                     $openPortsPerIp[$currentIP][$Protocol].Add($port)
                 }
             }
         }
     }
     
-    return $openPorts
+    return $openPortsPerIp
 }
 
 # --- EXECUTION ---
+
+# Dictionary to hold final discovered ports per IP, consolidating TCP and UDP
+# Structure: { '10.0.0.1' = @{ 'tcp' = @('22', '80'); 'udp' = @('53') } }
+$masterTargetPorts = @{}
+# Array to hold all <host> XML nodes for final consolidation
+$allHostNodes = [System.Collections.ArrayList]::new()
+
 
 # --- PHASE 1: Fast TCP Port Scan ---
 Write-Host "`n[PHASE 1] Starting fast TCP scan for all ports on targets: $targetArgument" -ForegroundColor Cyan
@@ -232,9 +267,18 @@ $nmapArgsTcp = "-sS -p- --min-rate $MinRate -T4 $excludeArgument -oA `"$tcpOutpu
 Write-Verbose "Executing: $NmapPath $nmapArgsTcp"
 Invoke-Expression "$NmapPath $nmapArgsTcp"
 
-$openTcpPorts = Parse-NmapGrepableOutput -FilePath "$($tcpOutputFileBase).gnmap" -Protocol "tcp"
-if ($openTcpPorts.Count -gt 0) {
-    Write-Host "[+] Found $($openTcpPorts.Count) unique open TCP port(s) across all targets: $($openTcpPorts -join ', ')" -ForegroundColor Green
+$tcpPortsPerIp = Parse-NmapGrepableOutput -FilePath "$($tcpOutputFileBase).gnmap" -Protocol "tcp"
+$tcpPortCount = 0
+
+foreach ($ip in $tcpPortsPerIp.Keys) {
+    $masterTargetPorts[$ip] = @{}
+    $masterTargetPorts[$ip]["tcp"] = $tcpPortsPerIp[$ip]["tcp"]
+    $masterTargetPorts[$ip]["udp"] = [System.Collections.Generic.List[string]]::new() # Initialize UDP list
+    $tcpPortCount += $masterTargetPorts[$ip]["tcp"].Count
+}
+
+if ($tcpPortCount -gt 0) {
+    Write-Host "[+] Found $tcpPortCount unique open TCP port(s) across $($tcpPortsPerIp.Count) host(s)." -ForegroundColor Green
 }
 else {
     Write-Host "[-] No open TCP ports found on the targets." -ForegroundColor Yellow
@@ -248,46 +292,143 @@ $nmapArgsUdp = "-sU --top-ports $TopUdpPorts -T4 $excludeArgument -oA `"$udpOutp
 Write-Verbose "Executing: $NmapPath $nmapArgsUdp"
 Invoke-Expression "$NmapPath $nmapArgsUdp"
 
-$openUdpPorts = Parse-NmapGrepableOutput -FilePath "$($udpOutputFileBase).gnmap" -Protocol "udp"
-if ($openUdpPorts.Count -gt 0) {
-    Write-Host "[+] Found $($openUdpPorts.Count) unique open UDP port(s) across all targets: $($openUdpPorts -join ', ')" -ForegroundColor Green
+$udpPortsPerIp = Parse-NmapGrepableOutput -FilePath "$($udpOutputFileBase).gnmap" -Protocol "udp"
+$udpPortCount = 0
+
+foreach ($ip in $udpPortsPerIp.Keys) {
+    # If the IP is new (no open TCP ports), initialize it
+    if (-not $masterTargetPorts.ContainsKey($ip)) {
+        $masterTargetPorts[$ip] = @{}
+        $masterTargetPorts[$ip]["tcp"] = [System.Collections.Generic.List[string]]::new() # Initialize TCP list
+    }
+    # Add UDP ports
+    $masterTargetPorts[$ip]["udp"] = $udpPortsPerIp[$ip]["udp"]
+    $udpPortCount += $masterTargetPorts[$ip]["udp"].Count
+}
+
+if ($udpPortCount -gt 0) {
+    Write-Host "[+] Found $udpPortCount unique open UDP port(s) across $($udpPortsPerIp.Count) host(s)." -ForegroundColor Green
 }
 else {
     Write-Host "[-] No open UDP ports found on the targets." -ForegroundColor Yellow
 }
 
+$totalTargets = $masterTargetPorts.Count
 
-# --- PHASE 3: Detailed Service Scan on Discovered Ports ---
-if ($openTcpPorts.Count -eq 0 -and $openUdpPorts.Count -eq 0) {
-    Write-Host "`n[INFO] No open ports were discovered in Phase 1 or 2. Skipping detailed scan." -ForegroundColor Yellow
+# --- PHASE 3: Detailed Service Scan on Discovered Ports (Per-Host) ---
+if ($totalTargets -eq 0) {
+    Write-Host "`n[INFO] No targets with open ports were discovered. Skipping detailed scan." -ForegroundColor Yellow
     Write-Host "Scan session complete. All logs are in: $sessionPath"
-    # Even if we skip phase 3, we still need to calculate and show the total run time.
 }
 else {
-    Write-Host "`n[PHASE 3] Starting detailed service scan on discovered open ports across targets: $targetArgument" -ForegroundColor Cyan
+    Write-Host "`n[PHASE 3] Starting detailed, per-host service scan on $totalTargets discovered targets." -ForegroundColor Cyan
     $finalOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-combined"
 
-    # Dynamically build the port string and scan type argument for the final scan
-    $portStringParts = [System.Collections.Generic.List[string]]::new()
-    $scanTypeArgument = ""
+    # Define final file paths
+    $finalNmapFile = "$($finalOutputFileBase).nmap"
+    $finalXmlFile = "$($finalOutputFileBase).xml"
+    $finalGrepableFile = "$($finalOutputFileBase).gnmap"
+    
+    # Initialize the combined text output files
+    "" | Out-File -FilePath $finalNmapFile -Force
+    "" | Out-File -FilePath $finalGrepableFile -Force
+    
+    $scanCount = 0
+    foreach ($ip in $masterTargetPorts.Keys) {
+        $scanCount++
+        $tcpPorts = $masterTargetPorts[$ip]["tcp"]
+        $udpPorts = $masterTargetPorts[$ip]["udp"]
+        
+        Write-Host "    [Target $scanCount/$totalTargets] Scanning $ip: T: $($tcpPorts.Count) port(s), U: $($udpPorts.Count) port(s)" -ForegroundColor Yellow
 
-    if ($openTcpPorts.Count -gt 0) {
-        $portStringParts.Add("T:$($openTcpPorts -join ',')")
-        # -sS is needed for the SYN scan on TCP ports
-        $scanTypeArgument += " -sS"
-    }
-    if ($openUdpPorts.Count -gt 0) {
-        $portStringParts.Add("U:$($openUdpPorts -join ',')")
-        # -sU is MANDATORY for Nmap to perform a UDP scan on the specified U: ports
-        $scanTypeArgument += " -sU"
+        $portStringParts = [System.Collections.Generic.List[string]]::new()
+        $scanTypeArgument = ""
+
+        if ($tcpPorts.Count -gt 0) {
+            $portStringParts.Add("T:$($tcpPorts -join ',')")
+            $scanTypeArgument += " -sS"
+        }
+        if ($udpPorts.Count -gt 0) {
+            $portStringParts.Add("U:$($udpPorts -join ',')")
+            $scanTypeArgument += " -sU"
+        }
+        
+        $finalPortString = $portStringParts -join ','
+        
+        # Build the Nmap command for this single IP
+        $tempOutputFileBase = Join-Path -Path $sessionPath -ChildPath "temp_$($ip.Replace('.', '_'))"
+        
+        # -sV, -sC, and -p are included; -oA is used for the temp file
+        $nmapArgsFinal = "$scanTypeArgument -sV -sC -p $finalPortString -oA `"$tempOutputFileBase`" $ip"
+        Write-Verbose "Executing: $NmapPath $nmapArgsFinal"
+        
+        # Run the Nmap command
+        Invoke-Expression "$NmapPath $nmapArgsFinal"
+        
+        # --- Consolidation: Nmap/Grepable (Simple Append) ---
+        Get-Content "$($tempOutputFileBase).nmap" -ErrorAction SilentlyContinue | Add-Content -Path $finalNmapFile
+        Get-Content "$($tempOutputFileBase).gnmap" -ErrorAction SilentlyContinue | Add-Content -Path $finalGrepableFile
+
+        # --- Consolidation: XML (Aggregate Host Nodes) ---
+        $tempXmlPath = "$($tempOutputFileBase).xml"
+        if (Test-Path $tempXmlPath) {
+            try {
+                [xml]$tempXml = Get-Content $tempXmlPath -Raw
+                # Check if 'host' nodes exist and add them to the master list
+                if ($tempXml.nmaprun.host) {
+                    # Handle multiple hosts (array) or single host (object)
+                    if ($tempXml.nmaprun.host -is [array]) {
+                        $tempXml.nmaprun.host | ForEach-Object { $allHostNodes.Add($_) | Out-Null }
+                    } else {
+                        $allHostNodes.Add($tempXml.nmaprun.host) | Out-Null
+                    }
+                }
+            }
+            catch {
+                Write-Warning "Could not parse XML for IP $ip. Skipping host node aggregation for this scan."
+            }
+        }
+        
+        # Clean up temporary text files
+        Remove-Item "$($tempOutputFileBase).nmap" -Force -ErrorAction SilentlyContinue
+        Remove-Item "$($tempOutputFileBase).gnmap" -Force -ErrorAction SilentlyContinue
     }
     
-    $finalPortString = $portStringParts -join ','
+    # --- FINAL XML ASSEMBLY (After all hosts are scanned) ---
+    Write-Host "Consolidating all host data into the final XML report..." -ForegroundColor Yellow
     
-    # Construct the final Nmap command, including the conditional scan type arguments
-    $nmapArgsFinal = "$scanTypeArgument -sV -sC -p $finalPortString $excludeArgument -oA `"$finalOutputFileBase`" $targetArgument"
-    Write-Verbose "Executing: $NmapPath $nmapArgsFinal"
-    Invoke-Expression "$NmapPath $nmapArgsFinal"
+    # Use the first successfully generated XML file as a template for the header/footer structure
+    $sampleXmlFile = Get-ChildItem -Path $sessionPath -Filter "temp_*.xml" | Select-Object -First 1 -ExpandProperty FullName
+    
+    if (-not $sampleXmlFile) {
+        Write-Warning "No valid XML template found. Skipping final XML file generation."
+    } else {
+        [xml]$masterXml = Get-Content $sampleXmlFile -Raw
+        
+        # Get the parent of the host node, which is <nmaprun>
+        $nmaprunNode = $masterXml.SelectSingleNode("/nmaprun")
+        
+        # Remove all existing children hosts from the template
+        $hostNodes = $nmaprunNode.SelectNodes("host")
+        foreach ($host in $hostNodes) {
+            $nmaprunNode.RemoveChild($host) | Out-Null
+        }
+        
+        # Add all aggregated host nodes
+        foreach ($hostNode in $allHostNodes) {
+            # ImportNode is necessary to move a node from one document to another
+            $nmaprunNode.AppendChild($masterXml.ImportNode($hostNode, $true)) | Out-Null
+        }
+
+        # Save the consolidated, valid XML document
+        $masterXml.Save($finalXmlFile)
+        Write-Host "[+] Consolidated XML report saved to: $finalXmlFile" -ForegroundColor Green
+    }
+    
+    # Clean up all remaining temporary XML files
+    Get-ChildItem -Path $sessionPath -Filter "temp_*.xml" | Remove-Item -Force -ErrorAction SilentlyContinue
+    
+    Write-Host "`n[PHASE 3 COMPLETE] Detailed results for all hosts consolidated into: $($BaseFileName)-combined files." -ForegroundColor Green
 }
 
 
@@ -299,4 +440,4 @@ Write-Host "All scan reports have been saved to the '$sessionPath' directory."
 $endTime = Get-Date
 $runTime = $endTime - $startTime
 $runTimeString = "{0:D2}h:{1:D2}m:{2:D2}s" -f $runTime.Hours, $runTime.Minutes, $runTime.Seconds
-Write-Host "Total script run time: $runTimeString" -ForegroundColor Green 
+Write-Host "Total script run time: $runTimeString" -ForegroundColor Green
