@@ -12,13 +12,18 @@
     The script requires either a -Subnet (e.g., 192.168.1.0/24) or an -InputList (e.g., ./my-hosts.txt).
 
     By default, the script automatically detects and excludes the machine running the scan from the targets.
-    All scan outputs are saved to a uniquely named folder for easy review using a user-provided base filename.
+    All scan outputs are saved to a uniquely named folder using the format [BaseFileName][Date]_[Time]
+    for easy review using a user-provided base filename.
     The script will output the total run time upon completion.
 
 .VERSION
-    2.2.0
+    2.2.1
 
 .CHANGES
+    [2025-11-05] v2.2.1
+    - FIXED BUG: Corrected a typo that prevented the UDP scan (Phase 2) from running correctly when parameters were supplied interactively.
+    - FEATURE: Updated output directory naming to use [BaseFileName][Date]_[Time] format (e.g., vlan-scan20251105_091530).
+
     [2025-10-23] v2.2.0
     - Updated version number to 2.2.0.
 
@@ -61,7 +66,7 @@
     .\run-phased-nmap-scan.ps1 -Subnet 192.168.1.0/24 -BaseFileName corp-vlan10-scan
 
     This command scans the 192.168.1.0/24 subnet and automatically excludes the scanning machine.
-    A new directory will be created, containing files like 'corp-vlan10-scan-tcpfast.nmap', etc.
+    A new directory will be created, containing files like 'corp-vlan10-scan20251105_091530/corp-vlan10-scan-tcpfast.nmap', etc.
 
 .EXAMPLE
     .\run-phased-nmap-scan.ps1 -InputList C:\scans\server-list.txt -BaseFileName critical-servers-scan
@@ -139,31 +144,10 @@ elseif ($PSCmdlet.ParameterSetName -eq "ListScan") {
     Write-Verbose "Scan target type: Input List ($InputList)"
 }
 
-# New folder naming logic: [BaseFileName][Date]S[ScanNumber]
-$dateStamp = Get-Date -Format "yyyyMMdd"
-$searchPattern = "$($BaseFileName)$($dateStamp)S*"
+# New folder naming logic: [BaseFileName][Date]_[Time]
+$dateTimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
-# Find existing scan folders for today with the same base name
-$existingScans = Get-ChildItem -Path $OutputDirectory -Directory -Filter $searchPattern -ErrorAction SilentlyContinue
-
-$maxScanNum = 0
-if ($existingScans) {
-    foreach ($scanFolder in $existingScans) {
-        # Match the S001, S002, etc. part
-        $match = [regex]::Match($scanFolder.Name, "$($BaseFileName)$($dateStamp)S(\d{3})$")
-        if ($match.Success) {
-            $currentScanNum = [int]$match.Groups[1].Value
-            if ($currentScanNum -gt $maxScanNum) {
-                $maxScanNum = $currentScanNum
-            }
-        }
-    }
-}
-
-$newScanNum = $maxScanNum + 1
-$newScanNumString = "{0:D3}" -f $newScanNum # Format as 3 digits (001, 002, etc.)
-
-$sessionName = "$($BaseFileName)$($dateStamp)S$($newScanNumString)"
+$sessionName = "$($BaseFileName)$($dateTimeStamp)"
 $sessionPath = Join-Path -Path $OutputDirectory -ChildPath $sessionName
 
 # Create a dedicated directory for this scan session's output
@@ -258,7 +242,7 @@ Write-Host "`n[PHASE 2] Starting scan for top $TopUdpPorts UDP ports on targets:
 $udpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-udpinitial"
 $nmapArgsUdp = "-sU --top-ports $TopUdpPorts -T4 $excludeArgument -oA `"$udpOutputFileBase`" $targetArgument"
 Write-Verbose "Executing: $NmapPath $nmapArgsUdp"
-Invoke-Expression "$NmapPath $nmapArgsUdim"
+Invoke-Expression "$NmapPath $nmapArgsUdp"
 
 $openUdpPorts = Parse-NmapGrepableOutput -FilePath "$($udpOutputFileBase).gnmap" -Protocol "udp"
 if ($openUdpPorts.Count -gt 0) {
