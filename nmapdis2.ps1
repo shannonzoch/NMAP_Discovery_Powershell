@@ -17,9 +17,13 @@
     The script will output the total run time upon completion.
 
 .VERSION
-    2.2.1
+    2.2.2
 
 .CHANGES
+    [2025-11-05] v2.2.2
+    - FIXED BUG: Ensured the -sU flag is correctly passed to the final combined scan (Phase 3) when UDP ports are present,
+      preventing Nmap from ignoring the 'U:' port specifier.
+
     [2025-11-05] v2.2.1
     - FIXED BUG: Corrected a typo that prevented the UDP scan (Phase 2) from running correctly when parameters were supplied interactively.
     - FEATURE: Updated output directory naming to use [BaseFileName][Date]_[Time] format (e.g., vlan-scan20251105_091530).
@@ -263,17 +267,25 @@ else {
     Write-Host "`n[PHASE 3] Starting detailed service scan on discovered open ports across targets: $targetArgument" -ForegroundColor Cyan
     $finalOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-combined"
 
-    # Dynamically build the port string for the final scan
+    # Dynamically build the port string and scan type argument for the final scan
     $portStringParts = [System.Collections.Generic.List[string]]::new()
+    $scanTypeArgument = ""
+
     if ($openTcpPorts.Count -gt 0) {
         $portStringParts.Add("T:$($openTcpPorts -join ',')")
+        # -sS is needed for the SYN scan on TCP ports
+        $scanTypeArgument += " -sS"
     }
     if ($openUdpPorts.Count -gt 0) {
         $portStringParts.Add("U:$($openUdpPorts -join ',')")
+        # -sU is MANDATORY for Nmap to perform a UDP scan on the specified U: ports
+        $scanTypeArgument += " -sU"
     }
+    
     $finalPortString = $portStringParts -join ','
     
-    $nmapArgsFinal = "-sV -sC -p $finalPortString $excludeArgument -oA `"$finalOutputFileBase`" $targetArgument"
+    # Construct the final Nmap command, including the conditional scan type arguments
+    $nmapArgsFinal = "$scanTypeArgument -sV -sC -p $finalPortString $excludeArgument -oA `"$finalOutputFileBase`" $targetArgument"
     Write-Verbose "Executing: $NmapPath $nmapArgsFinal"
     Invoke-Expression "$NmapPath $nmapArgsFinal"
 }
@@ -287,4 +299,4 @@ Write-Host "All scan reports have been saved to the '$sessionPath' directory."
 $endTime = Get-Date
 $runTime = $endTime - $startTime
 $runTimeString = "{0:D2}h:{1:D2}m:{2:D2}s" -f $runTime.Hours, $runTime.Minutes, $runTime.Seconds
-Write-Host "Total script run time: $runTimeString" -ForegroundColor Green
+Write-Host "Total script run time: $runTimeString" -ForegroundColor Green 
