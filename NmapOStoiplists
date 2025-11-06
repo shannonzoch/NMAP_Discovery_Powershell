@@ -30,6 +30,8 @@ The full path and filename for the output file containing IPs where the OS could
 .\scan_subnet.ps1 -Subnet "192.168.1.0/24" -WindowsOutputFile "C:\ScanData\windows_ips.txt" -LinuxOutputFile "C:\ScanData\linux_ips.txt" -UnknownOutputFile "C:\ScanData\other_ips.txt"
 #>
 # --- Version and Change Tracker ---
+# Version 0.0.3 - 2025-11-05
+# - RESOLVED: Fixed Nmap execution error ("Unknown argument to -O") by passing arguments as an array (@) instead of a single string, ensuring robust external command parsing in PowerShell.
 # Version 0.0.2 - 2025-11-05
 # - Changed default output filenames to 'wip.txt', 'lip.txt', and 'uip.txt'.
 # Version 0.0.1 - 2025-11-05
@@ -70,7 +72,13 @@ Write-Host "This scan uses OS detection (-O) and may take several minutes..."
 # -O: Enable OS detection
 # -T4: Aggressive timing template
 # -oG: Grepable output format for easy parsing
-$nmapArguments = "-O -T4 -oG $TempGrepableFile $Subnet"
+# Fixed Nmap argument parsing issue by using an array (@) (PowerShell best practice for external commands)
+$nmapArguments = @(
+    "-O",
+    "-T4",
+    "-oG", $TempGrepableFile,
+    $Subnet
+)
 
 # Run Nmap and capture output/errors
 try {
