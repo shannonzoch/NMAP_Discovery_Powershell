@@ -18,9 +18,16 @@
     The script will output the total run time upon completion.
 
 .VERSION
-    2.3.5
+    2.3.6
 
 .CHANGES
+    [2025-11-10] v2.3.6
+    - CRITICAL FIX: Renamed loop variable in XML consolidation (Phase 3) from `$host` to `$node`. The variable `$host` is a
+      read-only system variable in PowerShell, which caused a "cannot overwrite variable" error.
+    - ROBUSTNESS: Added sanitization for the -BaseFileName parameter to remove invalid file/path characters (e.g., /,\,:)
+      which could cause the script to fail when creating the output directory or saving files.
+    - BUGFIX: Corrected runtime string format from `{2:DD}s` to `{2:ss}s`.
+
     [2025-11-05] v2.3.5
     - CRITICAL FIX: Fixed PowerShell string interpolation error: "Variable reference is not valid. ':' was not followed by valid variable character."
       Corrected `$ip:` to `${ip}:` in the Write-Host and Write-Warning lines in Phase 3 to properly delimit the variable name.
@@ -144,6 +151,12 @@ param(
 
 # Start timer for total run time calculation
 $startTime = Get-Date
+
+# Sanitize BaseFileName to remove invalid path characters
+$invalidChars = [System.IO.Path]::GetInvalidFileNameChars() -join ''
+$regexInvalidChars = [regex]::Escape($invalidChars)
+$BaseFileName = $BaseFileName -replace "[$regexInvalidChars]", '_'
+Write-Verbose "Sanitized BaseFileName to: $BaseFileName"
 
 # --- PRE-FLIGHT CHECKS ---
 Write-Verbose "Starting pre-flight checks."
@@ -460,8 +473,9 @@ else {
         
         # Remove all existing children hosts from the template
         $hostNodes = $nmaprunNode.SelectNodes("host")
-        foreach ($host in $hostNodes) {
-            $nmaprunNode.RemoveChild($host) | Out-Null
+        # FIX: Renamed variable from $host (read-only) to $node
+        foreach ($node in $hostNodes) {
+            $nmaprunNode.RemoveChild($node) | Out-Null
         }
         
         # Add all aggregated host nodes
@@ -489,5 +503,6 @@ Write-Host "All scan reports have been saved to the '$sessionPath' directory."
 # Calculate and display total run time
 $endTime = Get-Date
 $runTime = $endTime - $startTime
-$runTimeString = "{0:D2}h:{1:D2}m:{2:DD}s" -f $runTime.Hours, $runTime.Minutes, $runTime.Seconds
+# FIX: Corrected format specifier for seconds from DD to ss
+$runTimeString = "{0:D2}h:{1:D2}m:{2:ss}s" -f $runTime.Hours, $runTime.Minutes, $runTime.Seconds
 Write-Host "Total script run time: $runTimeString" -ForegroundColor Green
