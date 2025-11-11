@@ -18,9 +18,21 @@
     The script will output the total run time upon completion.
 
 .VERSION
-    2.3.6
+    2.3.8
 
 .CHANGES
+    [2025-11-10] v2.3.8
+    - FEATURE: Added -TcpGrepableFile and -UdpGrepableFile optional parameters. This allows the user
+      to provide existing .gnmap files to skip Phase 1 and/or Phase 2, jumping directly to
+      parsing and/or the detailed Phase 3 scan.
+
+    [2025-11-10] v2.3.7
+    - CRITICAL FIX: Added `return` to the `catch` block for the `New-Item -Path $sessionPath` command. This forces the script
+      to stop if it fails to create the output directory, preventing the "Could not find part of the path" error during file save.
+    - NMAP FIX (NSOCK): Added `--source-port 0` to Phase 2 (UDP) and Phase 3 (Per-Host) Nmap commands. This prevents the
+      "NSOCK ERROR... Bind... failed... access... forbidden" error on Windows when Nmap tries to use a privileged port
+      (like 500/udp) that is already in use by a system service.
+
     [2025-11-10] v2.3.6
     - CRITICAL FIX: Renamed loop variable in XML consolidation (Phase 3) from `$host` to `$node`. The variable `$host` is a
       read-only system variable in PowerShell, which caused a "cannot overwrite variable" error.
@@ -100,6 +112,14 @@
 .PARAMETER OutputDirectory
     The base directory where a new folder for scan results will be created. The default is the current directory.
 
+.PARAMETER TcpGrepableFile
+    Optional. Path to a pre-existing .gnmap file from a Phase 1 scan. If provided, the script will
+    skip Phase 1 and use this file as its source for open TCP ports.
+
+.PARAMETER UdpGrepableFile
+    Optional. Path to a pre-existing .gnmap file from a Phase 2 scan. If provided, the script will
+    skip Phase 2 and use this file as its source for open UDP ports.
+
 .EXAMPLE
     .\run-phased-nmap-scan.ps1 -Subnet 192.168.1.0/24 -BaseFileName corp-vlan10-scan
 
@@ -111,6 +131,18 @@
 
     This command scans only the hosts specified in the 'server-list.txt' file and saves the.
     with the base name 'critical-servers-scan'.
+
+.EXAMPLE
+    .\run-phased-nmap-scan.ps1 -Subnet 10.0.0.0/24 -BaseFileName vlan10-rerun -TcpGrepableFile C:\scans\old-scan\scan-tcpfast.gnmap -UdpGrepableFile C:\scans\old-scan\scan-udpinitial.gnmap
+
+    This command skips Phase 1 and Phase 2 entirely. It parses the two provided .gnmap files
+    and immediately begins the detailed Phase 3 scan against the hosts and ports found in them.
+
+.EXAMPLE
+    .\run-phased-nmap-scan.ps1 -Subnet 10.0.0.0/24 -BaseFileName vlan10-udp-update -TcpGrepableFile C:\scans\old-scan\scan-tcpfast.gnmap
+
+    This command skips Phase 1 (using the provided TCP file) but WILL execute Phase 2 to scan
+    for UDP ports on the 10.0.0.0/24 subnet before proceeding to Phase 3.
 
 .NOTES
     Requires Nmap to be installed on the system. Download from https://nmap.org/download.html
@@ -146,7 +178,25 @@ param(
     [string]$NmapPath = "nmap",
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputDirectory = "."
+    [string]$OutputDirectory = ".",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateScript({
+        if (-not (Test-Path -Path $_ -PathType Leaf)) {
+            throw "TCP Grepable file not found: $_"
+        }
+        return $true
+    })]
+    [string]$TcpGrepableFile,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateScript({
+        if (-not (Test-Path -Path $_ -PathType Leaf)) {
+            throw "UDP Grepable file not found: $_"
+        }
+        return $true
+    })]
+    [string]$UdpGrepableFile
 )
 
 # Start timer for total run time calculation
@@ -203,7 +253,7 @@ try {
 }
 catch {
     Write-Error "Failed to create output directory '$sessionPath'. Please check permissions."
-    return
+    return # CRITICAL FIX: Stop execution if directory creation fails.
 }
 
 # Determine if the scanner's own IP should be excluded (default behavior)
@@ -291,20 +341,28 @@ $allHostNodes = [System.Collections.ArrayList]::new()
 
 
 # --- PHASE 1: Fast TCP Port Scan ---
-Write-Host "`n[PHASE 1] Starting fast TCP scan for all ports on targets: $($targetArgumentArray -join ' ')" -ForegroundColor Cyan
-$tcpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-tcpfast"
+$tcpGrepableFile = $null # Will be set to the .gnmap file path
 
-# Build argument array for safe execution
-$nmapArgsTcpArray = @("-sS", "-p-", "--min-rate", "$MinRate", "-T4")
-if ($excludeArgumentArray.Count -gt 0) { $nmapArgsTcpArray += $excludeArgumentArray }
-$nmapArgsTcpArray += @("-oA", $tcpOutputFileBase)
-$nmapArgsTcpArray += $targetArgumentArray # Add target(s)
+if (-not [string]::IsNullOrEmpty($TcpGrepableFile)) {
+    Write-Host "`n[PHASE 1] Skipping TCP scan. Using provided file: $TcpGrepableFile" -ForegroundColor Cyan
+    $tcpGrepableFile = $TcpGrepableFile
+} else {
+    Write-Host "`n[PHASE 1] Starting fast TCP scan for all ports on targets: $($targetArgumentArray -join ' ')" -ForegroundColor Cyan
+    $tcpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-tcpfast"
+    $tcpGrepableFile = "$($tcpOutputFileBase).gnmap" # Set path for parsing
 
-Write-Verbose "Executing: $NmapPath $($nmapArgsTcpArray -join ' ')"
-# Execute Nmap using the call operator (&)
-& $NmapPath @nmapArgsTcpArray
+    # Build argument array for safe execution
+    $nmapArgsTcpArray = @("-sS", "-p-", "--min-rate", "$MinRate", "-T4")
+    if ($excludeArgumentArray.Count -gt 0) { $nmapArgsTcpArray += $excludeArgumentArray }
+    $nmapArgsTcpArray += @("-oA", $tcpOutputFileBase)
+    $nmapArgsTcpArray += $targetArgumentArray # Add target(s)
 
-$tcpPortsPerIp = Parse-NmapGrepableOutput -FilePath "$($tcpOutputFileBase).gnmap" -Protocol "tcp"
+    Write-Verbose "Executing: $NmapPath $($nmapArgsTcpArray -join ' ')"
+    # Execute Nmap using the call operator (&)
+    & $NmapPath @nmapArgsTcpArray
+}
+
+$tcpPortsPerIp = Parse-NmapGrepableOutput -FilePath $tcpGrepableFile -Protocol "tcp"
 $tcpPortCount = 0
 
 foreach ($ip in $tcpPortsPerIp.Keys) {
@@ -323,20 +381,29 @@ else {
 
 
 # --- PHASE 2: Common UDP Port Scan ---
-Write-Host "`n[PHASE 2] Starting scan for top $TopUdpPorts UDP ports on targets: $($targetArgumentArray -join ' ')" -ForegroundColor Cyan
-$udpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-udpinitial"
+$udpGrepableFile = $null # Will be set to the .gnmap file path
 
-# Build argument array for safe execution
-$nmapArgsUdpArray = @("-sU", "--top-ports", "$TopUdpPorts", "-T4")
-if ($excludeArgumentArray.Count -gt 0) { $nmapArgsUdpArray += $excludeArgumentArray }
-$nmapArgsUdpArray += @("-oA", $udpOutputFileBase)
-$nmapArgsUdpArray += $targetArgumentArray # Add target(s)
+if (-not [string]::IsNullOrEmpty($UdpGrepableFile)) {
+    Write-Host "`n[PHASE 2] Skipping UDP scan. Using provided file: $UdpGrepableFile" -ForegroundColor Cyan
+    $udpGrepableFile = $UdpGrepableFile
+} else {
+    Write-Host "`n[PHASE 2] Starting scan for top $TopUdpPorts UDP ports on targets: $($targetArgumentArray -join ' ')" -ForegroundColor Cyan
+    $udpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-udpinitial"
+    $udpGrepableFile = "$($udpOutputFileBase).gnmap" # Set path for parsing
 
-Write-Verbose "Executing: $NmapPath $($nmapArgsUdpArray -join ' ')"
-# Execute Nmap using the call operator (&)
-& $NmapPath @nmapArgsUdpArray
+    # Build argument array for safe execution
+    # NMAP FIX: Added --source-port 0 to prevent NSOCK bind errors on Windows
+    $nmapArgsUdpArray = @("-sU", "--top-ports", "$TopUdpPorts", "-T4", "--source-port", "0")
+    if ($excludeArgumentArray.Count -gt 0) { $nmapArgsUdpArray += $excludeArgumentArray }
+    $nmapArgsUdpArray += @("-oA", $udpOutputFileBase)
+    $nmapArgsUdpArray += $targetArgumentArray # Add target(s)
 
-$udpPortsPerIp = Parse-NmapGrepableOutput -FilePath "$($udpOutputFileBase).gnmap" -Protocol "udp"
+    Write-Verbose "Executing: $NmapPath $($nmapArgsUdpArray -join ' ')"
+    # Execute Nmap using the call operator (&)
+    & $NmapPath @nmapArgsUdpArray
+}
+
+$udpPortsPerIp = Parse-NmapGrepableOutput -FilePath $udpGrepableFile -Protocol "udp"
 $udpPortCount = 0
 
 foreach ($ip in $udpPortsPerIp.Keys) {
@@ -422,7 +489,8 @@ else {
         $tempOutputFileBase = Join-Path -Path $sessionPath -ChildPath "temp_$($ip.Replace('.', '_'))"
         
         # Add core arguments: -sV, -sC, -p, -oA, temp_base, and IP
-        $nmapArgsFinalArray += @("-sV", "-sC", "-p", $finalPortString, "-oA", $tempOutputFileBase, $ip)
+        # NMAP FIX: Added --source-port 0 to prevent NSOCK bind errors on Windows
+        $nmapArgsFinalArray += @("-sV", "-sC", "--source-port", "0", "-p", $finalPortString, "-oA", $tempOutputFileBase, $ip)
         Write-Verbose "Executing: $NmapPath $($nmapArgsFinalArray -join ' ')"
         
         # Run the Nmap command using the call operator (&)
@@ -504,5 +572,5 @@ Write-Host "All scan reports have been saved to the '$sessionPath' directory."
 $endTime = Get-Date
 $runTime = $endTime - $startTime
 # FIX: Corrected format specifier for seconds from DD to ss
-$runTimeString = "{0:D2}h:{1:D2}m:{2:ss}s" -f $runTime.Hours, $runTime.Minutes, $runTime.Seconds
+$runTimeString = "{0:D2}h:{1:D2}m:{2:ss}s" -f $runTime.Hours, $runim.Minutes, $runTime.Seconds
 Write-Host "Total script run time: $runTimeString" -ForegroundColor Green
