@@ -13,14 +13,21 @@
     The script requires either a -Subnet (e.g., 192.168.1.0/24) or an -InputList (e.g., ./my-hosts.txt).
 
     By default, the script automatically detects and excludes the machine running the scan from the targets.
-    All scan outputs are saved to a uniquely named folder using the format [BaseFileName][Date]_[Time]
+    All scan outputs are saved to a uniquely named folder using the format [BaseFileName][Date]S[ScanNumber]
     for easy review using a user-provided base filename.
-    The script will output the total run time upon completion.
+    The script will output the run time for each phase and the total run time upon completion.
 
 .VERSION
-    2.3.8
+    2.3.9
 
 .CHANGES
+    [2025-11-11] v2.3.9
+    - FEATURE: Added individual timers for Phase 1, Phase 2, and Phase 3 to show the runtime for each phase.
+    - FEATURE: Re-implemented output directory naming to use sequential numbering for the same day, e.g.,
+      [BaseFileName][Date]S[ScanNumber] (e.g., vlan-scan20251111S001). The sequential number is only
+      added if a scan with the same base name already exists for the current day.
+    - BUGFIX: Fixed typo in final runtime string calculation (`$runim.Minutes` to `$runTime.Minutes`).
+
     [2025-11-10] v2.3.8
     - FEATURE: Added -TcpGrepableFile and -UdpGrepableFile optional parameters. This allows the user
       to provide existing .gnmap files to skip Phase 1 and/or Phase 2, jumping directly to
@@ -124,7 +131,8 @@
     .\run-phased-nmap-scan.ps1 -Subnet 192.168.1.0/24 -BaseFileName corp-vlan10-scan
 
     This command scans the 192.168.1.0/24 subnet and automatically excludes the scanning machine.
-    A new directory will be created, containing files like 'corp-vlan10-scan20251105_091530/corp-vlan10-scan-tcpfast.nmap', etc.
+    A new directory will be created, e.g., '.\corp-vlan10-scan20251111'. If that directory exists,
+    it will create '.\corp-vlan10-scan20251111S001', then 'S002', etc.
 
 .EXAMPLE
     .\run-phased-nmap-scan.ps1 -InputList C:\scans\server-list.txt -BaseFileName critical-servers-scan
@@ -200,7 +208,13 @@ param(
 )
 
 # Start timer for total run time calculation
-$startTime = Get-Date
+$scriptStartTime = Get-Date
+
+# Helper function to format timespans
+function Format-TimeSpan {
+    param($TimeSpan)
+    return "{0:D2}h:{1:D2}m:{2:ss}s" -f $TimeSpan.Hours, $TimeSpan.Minutes, $TimeSpan.Seconds
+}
 
 # Sanitize BaseFileName to remove invalid path characters
 $invalidChars = [System.IO.Path]::GetInvalidFileNameChars() -join ''
@@ -238,11 +252,25 @@ elseif ($PSCmdlet.ParameterSetName -eq "ListScan") {
     Write-Verbose "Scan target type: Input List ($InputList)"
 }
 
-# New folder naming logic: [BaseFileName][Date]_[Time]
-$dateTimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+# New folder naming logic: [BaseFileName][Date]S[ScanNumber]
+$dateStamp = Get-Date -Format "yyyyMMdd"
+$baseSessionName = "$($BaseFileName)$($dateStamp)"
+$sessionPath = Join-Path -Path $OutputDirectory -ChildPath $baseSessionName
 
-$sessionName = "$($BaseFileName)$($dateTimeStamp)"
-$sessionPath = Join-Path -Path $OutputDirectory -ChildPath $sessionName
+# Check if this base path already exists. If so, find the next available sequential number.
+if (Test-Path -Path $sessionPath) {
+    $scanNumber = 1
+    $scanSuffix = "S{0:D3}" -f $scanNumber
+    $newSessionName = "$($baseSessionName)$($scanSuffix)"
+    $sessionPath = Join-Path -Path $OutputDirectory -ChildPath $newSessionName
+    
+    while (Test-Path -Path $sessionPath) {
+        $scanNumber++
+        $scanSuffix = "S{0:D3}" -f $scanNumber
+        $newSessionName = "$($baseSessionName)$($scanSuffix)"
+        $sessionPath = Join-Path -Path $OutputDirectory -ChildPath $newSessionName
+    }
+}
 
 # Create a dedicated directory for this scan session's output
 try {
@@ -341,6 +369,7 @@ $allHostNodes = [System.Collections.ArrayList]::new()
 
 
 # --- PHASE 1: Fast TCP Port Scan ---
+$phase1StartTime = Get-Date
 $tcpGrepableFile = $null # Will be set to the .gnmap file path
 
 if (-not [string]::IsNullOrEmpty($TcpGrepableFile)) {
@@ -378,9 +407,12 @@ if ($tcpPortCount -gt 0) {
 else {
     Write-Host "[-] No open TCP ports found on the targets." -ForegroundColor Yellow
 }
+$phase1EndTime = Get-Date
+Write-Host "[PHASE 1] Completed in: $(Format-TimeSpan($phase1EndTime - $phase1StartTime))" -ForegroundColor Cyan
 
 
 # --- PHASE 2: Common UDP Port Scan ---
+$phase2StartTime = Get-Date
 $udpGrepableFile = $null # Will be set to the .gnmap file path
 
 if (-not [string]::IsNullOrEmpty($UdpGrepableFile)) {
@@ -423,6 +455,9 @@ if ($udpPortCount -gt 0) {
 else {
     Write-Host "[-] No open UDP ports found on the targets." -ForegroundColor Yellow
 }
+$phase2EndTime = Get-Date
+Write-Host "[PHASE 2] Completed in: $(Format-TimeSpan($phase2EndTime - $phase2StartTime))" -ForegroundColor Cyan
+
 
 # --- CREATE HOSTS.TXT FILE ---
 $hostsFile = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-hosts.txt"
@@ -438,6 +473,7 @@ if ($uniqueIPs.Count -gt 0) {
 $totalTargets = $masterTargetPorts.Count
 
 # --- PHASE 3: Detailed Service Scan on Discovered Ports (Per-Host) ---
+$phase3StartTime = Get-Date
 if ($totalTargets -eq 0) {
     Write-Host "`n[INFO] No targets with open ports were discovered. Skipping detailed scan." -ForegroundColor Yellow
     Write-Host "Scan session complete. All logs are in: $sessionPath"
@@ -562,6 +598,8 @@ else {
     
     Write-Host "`n[PHASE 3 COMPLETE] Detailed results for all hosts consolidated into: $($BaseFileName)-combined files." -ForegroundColor Green
 }
+$phase3EndTime = Get-Date
+Write-Host "[PHASE 3] Completed in: $(Format-TimeSpan($phase3EndTime - $phase3StartTime))" -ForegroundColor Cyan
 
 
 # --- COMPLETION ---
@@ -569,8 +607,8 @@ Write-Host "`n[COMPLETE] Scan session finished." -ForegroundColor Green
 Write-Host "All scan reports have been saved to the '$sessionPath' directory."
 
 # Calculate and display total run time
-$endTime = Get-Date
-$runTime = $endTime - $startTime
-# FIX: Corrected format specifier for seconds from DD to ss
-$runTimeString = "{0:D2}h:{1:D2}m:{2:ss}s" -f $runTime.Hours, $runim.Minutes, $runTime.Seconds
+$scriptEndTime = Get-Date
+$runTime = $scriptEndTime - $scriptStartTime
+# FIX: Corrected variable name from $runim to $runTime
+$runTimeString = "{0:D2}h:{1:D2}m:{2:ss}s" -f $runTime.Hours, $runTime.Minutes, $runTime.Seconds
 Write-Host "Total script run time: $runTimeString" -ForegroundColor Green
