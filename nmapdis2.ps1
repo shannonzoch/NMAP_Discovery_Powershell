@@ -18,9 +18,16 @@
     The script will output the run time for each phase and the total run time upon completion.
 
 .VERSION
-    2.3.9
+    2.4.0
 
 .CHANGES
+    [2025-11-11] v2.4.0
+    - CRITICAL FIX: Fixed variable name collision for -TcpGrepableFile and -UdpGrepableFile parameters.
+      The script was declaring a local variable with the same name as the parameter, which
+      caused the parameter's value to be overwritten ($null). This resulted in the script
+      always re-running the scan phases, even when a skip file was provided.
+      Renamed local variables to `$phase1GrepableFile` and `$phase2GrepableFile` to fix the logic.
+
     [2025-11-11] v2.3.9
     - FEATURE: Added individual timers for Phase 1, Phase 2, and Phase 3 to show the runtime for each phase.
     - FEATURE: Re-implemented output directory naming to use sequential numbering for the same day, e.g.,
@@ -370,15 +377,15 @@ $allHostNodes = [System.Collections.ArrayList]::new()
 
 # --- PHASE 1: Fast TCP Port Scan ---
 $phase1StartTime = Get-Date
-$tcpGrepableFile = $null # Will be set to the .gnmap file path
+$phase1GrepableFile = $null # Use a *different* variable name than the parameter
 
-if (-not [string]::IsNullOrEmpty($TcpGrepableFile)) {
+if (-not [string]::IsNullOrEmpty($TcpGrepableFile)) { # Check the PARAMETER
     Write-Host "`n[PHASE 1] Skipping TCP scan. Using provided file: $TcpGrepableFile" -ForegroundColor Cyan
-    $tcpGrepableFile = $TcpGrepableFile
+    $phase1GrepableFile = $TcpGrepableFile # Assign the PARAMETER value to the LOCAL VAR
 } else {
     Write-Host "`n[PHASE 1] Starting fast TCP scan for all ports on targets: $($targetArgumentArray -join ' ')" -ForegroundColor Cyan
     $tcpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-tcpfast"
-    $tcpGrepableFile = "$($tcpOutputFileBase).gnmap" # Set path for parsing
+    $phase1GrepableFile = "$($tcpOutputFileBase).gnmap" # Set LOCAL VAR path for parsing
 
     # Build argument array for safe execution
     $nmapArgsTcpArray = @("-sS", "-p-", "--min-rate", "$MinRate", "-T4")
@@ -391,7 +398,7 @@ if (-not [string]::IsNullOrEmpty($TcpGrepableFile)) {
     & $NmapPath @nmapArgsTcpArray
 }
 
-$tcpPortsPerIp = Parse-NmapGrepableOutput -FilePath $tcpGrepableFile -Protocol "tcp"
+$tcpPortsPerIp = Parse-NmapGrepableOutput -FilePath $phase1GrepableFile -Protocol "tcp"
 $tcpPortCount = 0
 
 foreach ($ip in $tcpPortsPerIp.Keys) {
@@ -413,15 +420,15 @@ Write-Host "[PHASE 1] Completed in: $(Format-TimeSpan($phase1EndTime - $phase1St
 
 # --- PHASE 2: Common UDP Port Scan ---
 $phase2StartTime = Get-Date
-$udpGrepableFile = $null # Will be set to the .gnmap file path
+$phase2GrepableFile = $null # Use a *different* variable name than the parameter
 
-if (-not [string]::IsNullOrEmpty($UdpGrepableFile)) {
+if (-not [string]::IsNullOrEmpty($UdpGrepableFile)) { # Check the PARAMETER
     Write-Host "`n[PHASE 2] Skipping UDP scan. Using provided file: $UdpGrepableFile" -ForegroundColor Cyan
-    $udpGrepableFile = $UdpGrepableFile
+    $phase2GrepableFile = $UdpGrepableFile # Assign the PARAMETER value to the LOCAL VAR
 } else {
     Write-Host "`n[PHASE 2] Starting scan for top $TopUdpPorts UDP ports on targets: $($targetArgumentArray -join ' ')" -ForegroundColor Cyan
     $udpOutputFileBase = Join-Path -Path $sessionPath -ChildPath "$($BaseFileName)-udpinitial"
-    $udpGrepableFile = "$($udpOutputFileBase).gnmap" # Set path for parsing
+    $phase2GrepableFile = "$($udpOutputFileBase).gnmap" # Set LOCAL VAR path for parsing
 
     # Build argument array for safe execution
     # NMAP FIX: Added --source-port 0 to prevent NSOCK bind errors on Windows
@@ -435,7 +442,7 @@ if (-not [string]::IsNullOrEmpty($UdpGrepableFile)) {
     & $NmapPath @nmapArgsUdpArray
 }
 
-$udpPortsPerIp = Parse-NmapGrepableOutput -FilePath $udpGrepableFile -Protocol "udp"
+$udpPortsPerIp = Parse-NmapGrepableOutput -FilePath $phase2GrepableFile -Protocol "udp"
 $udpPortCount = 0
 
 foreach ($ip in $udpPortsPerIp.Keys) {
